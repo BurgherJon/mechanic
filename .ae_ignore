@@ -1,0 +1,82 @@
+# Files NOT uploaded to Vertex AI when `adk deploy agent_engine` runs.
+#
+# THIS IS THE ONLY ignore file `adk deploy agent_engine` reads (ADK 2.x). There
+# is deliberately no .adkignore — ADK never read it, so keeping a second file in
+# sync was a silent footgun (the live one here once lacked venv exclusion while
+# a correct-looking .adkignore sat next to it and did nothing). One source of
+# truth.
+#
+# SYNTAX IS NOT .gitignore. ADK feeds these lines to Python's
+# shutil.ignore_patterns, which runs fnmatch against BASENAMES only. So:
+#   - No trailing slashes:  write `venv`, not `venv/`.
+#   - No path patterns:     `**/.terraform` never matches — fnmatch sees only
+#                           the basename `.terraform`. List the bare basename
+#                           (`.terraform`) and it's excluded wherever it appears.
+#   - A basename match prunes that entry at every depth (e.g. `__pycache__`
+#     anywhere in the tree is dropped).
+
+# Python virtual environments (the #1 cause of an over-8MB bundle)
+venv
+.venv
+env
+ENV
+
+# Python cache / build
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+.Python
+
+# Secrets and local config — never ship to the cloud
+.env
+.env.*
+credentials
+*-sa-key.json
+*-key.json
+*service-account*.json
+*credentials*.json
+
+# Git
+.git
+.gitignore
+
+# IDE / editor / OS
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.claude
+
+# Other ignore files
+.gcloudignore
+
+# Terraform (never goes to the Reasoning Engine container)
+terraform
+.terraform
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# Template-maintainer files (in case the user kept them)
+test.md
+MAINTAINER_SETUP.md
+.readme_template_post_setup.md
+
+# Operator scripts (not needed at runtime)
+get_started_linux.sh
+deploy_and_update.sh
+register_agent.py
+
+# Docs (don't bloat the container)
+README.md
+AGENTS.md
+CONTRIBUTING.md
+TRADEMARK.md
+LICENSE.txt
+THIRD_PARTY_LICENSES
+.github

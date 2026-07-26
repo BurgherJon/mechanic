@@ -1,0 +1,31 @@
+python-dotenv
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+google-cloud-secret-manager
+google-cloud-firestore
+google-cloud-aiplatform
+google-genai
+# [a2a] pulls the a2a package the ADK API server needs for its task store. The
+# deployed engine runs `adk api_server`, which imports
+# a2a.server.tasks.InMemoryTaskStore at startup whether or not this agent uses
+# A2A — without the extra, the engine fails to boot with
+# ModuleNotFoundError: No module named 'a2a'.
+#
+# We deliberately do NOT enable the ADK's GCP cloud tracing (no --trace_to_cloud
+# / --otel_to_cloud in deploy_and_update.sh). Both flags pull the OpenTelemetry
+# GCP exporter stack, which is currently unsatisfiable against the OTel core the
+# ADK pulls (the GCP exporters want opentelemetry-sdk <1.39 while the ADK pulls
+# >=1.41) → boot crash. Without the flags the ADK uses a plain TracerProvider
+# and boots cleanly. Cloud LOGGING is unaffected (the platform captures stdout
+# independently), so engine logs still work. Re-enable cloud tracing once the
+# GCP OTel exporters support the newer SDK.
+#
+# google-adk is left unpinned (latest) for a quickstart. Trade-off: a transitive
+# dep can change under you between deploys — if a deploy suddenly breaks with no
+# code change, suspect a dependency bump first and check the engine build log for
+# versions.
+google-adk[a2a]
+mcp
+google-cloud-storage
