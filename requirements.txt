@@ -27,5 +27,5 @@ google-genai
 # code change, suspect a dependency bump first and check the engine build log for
 # versions.
 google-adk[a2a]
-mcp
+mcp>=1.5,<2
 google-cloud-storage

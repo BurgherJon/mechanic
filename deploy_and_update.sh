@@ -95,16 +95,24 @@ ok()   { echo -e "\033[1;32m  [OK] $*\033[0m"; }
 err()  { echo -e "\033[1;31m  [xx] $*\033[0m" >&2; }
 warn() { echo -e "\033[1;33m  [!!] $*\033[0m"; }
 
-get_existing_agent_id() {
+# Print the id of EVERY engine whose display name matches exactly, one per
+# line. Deliberately different from the old get_existing_agent_id (AGE-7):
+#   - errors are NOT swallowed — a failed lookup must abort the deploy, not
+#     read as "no existing engine" and skip blue/green cleanup;
+#   - exact match, not substring — overlapping agent names must not
+#     cross-match;
+#   - all matches, not the first — a failed prior deploy leaves a second
+#     same-name engine behind, and picking the wrong one deleted the broken
+#     engine while orphaning the live one.
+get_existing_agent_ids() {
     "$ADK_PYTHON" -c "
 import vertexai
 from vertexai.preview import reasoning_engines
 vertexai.init(project='${FORUM_PROJECT_ID}', location='${REGION}')
 for e in reasoning_engines.ReasoningEngine.list():
-    if '${AGENT_DISPLAY_NAME}' in (e.display_name or ''):
+    if (e.display_name or '') == '${AGENT_DISPLAY_NAME}':
         print(e.resource_name.split('/')[-1])
-        break
-" 2>/dev/null || true
+"
 }
 
 get_agent_resource_name() {
@@ -130,6 +138,20 @@ if ! command -v "$ADK_BIN" >/dev/null 2>&1 && [[ ! -x "$ADK_BIN" ]]; then
     exit 1
 fi
 ok "ADK binary: $ADK_BIN"
+
+# The engine lookup (Step 1), liveness verification (Step 3), and session
+# cleanup (Step 5) all run through ADK_PYTHON. If its venv is broken —
+# e.g. gutted by a system Python upgrade — the old behavior was for the
+# Step 1 lookup to silently report "no existing engine" and leak the live
+# engine as an orphan at cleanup time (AGE-7). Fail here instead, with a
+# message that says what to do.
+if ! "$ADK_PYTHON" -c "import vertexai" >/dev/null 2>&1; then
+    err "ADK_PYTHON ($ADK_PYTHON) cannot import vertexai — its venv is broken"
+    err "or dependencies are missing. Rebuild it and re-run:"
+    err "  python3 -m venv --clear .venv && .venv/bin/pip install -r requirements.txt"
+    exit 1
+fi
+ok "ADK python can import vertexai"
 
 # ------------------------------------------------------------------
 # Pre-flight: deploy bundle size guard
@@ -215,10 +237,22 @@ fi
 # ------------------------------------------------------------------
 # Step 1: Look for the existing Reasoning Engine (for blue/green)
 # ------------------------------------------------------------------
-log "Step 1: Looking for existing '${AGENT_DISPLAY_NAME}' Reasoning Engine..."
-OLD_AGENT_ID=$(get_existing_agent_id)
-if [[ -n "$OLD_AGENT_ID" ]]; then
-    ok "Found: $(get_agent_resource_name "$OLD_AGENT_ID")"
+log "Step 1: Looking for existing '${AGENT_DISPLAY_NAME}' Reasoning Engine(s)..."
+OLD_AGENT_IDS=$(get_existing_agent_ids) || {
+    err "Could not list existing Reasoning Engines — refusing to deploy blind."
+    err "Treating a lookup failure as 'no existing engine' is how a live engine"
+    err "gets orphaned at cleanup time (AGE-7). Fix the error above and re-run."
+    exit 1
+}
+if [[ -n "$OLD_AGENT_IDS" ]]; then
+    for OLD_ID in $OLD_AGENT_IDS; do
+        ok "Found: $(get_agent_resource_name "$OLD_ID")"
+    done
+    if [[ $(echo "$OLD_AGENT_IDS" | wc -l) -gt 1 ]]; then
+        warn "Multiple engines share this display name — usually leftovers from a"
+        warn "failed deploy. ALL of them will be deleted after the new engine is"
+        warn "verified and Firestore is repointed."
+    fi
 else
     warn "No existing Reasoning Engine found. Will create a new one."
 fi
@@ -376,21 +410,31 @@ fi
 # ------------------------------------------------------------------
 # Step 6: Delete the old Reasoning Engine
 # ------------------------------------------------------------------
-if [[ -n "$OLD_AGENT_ID" && "$OLD_AGENT_ID" != "$NEW_AGENT_ID" ]]; then
-    log "Step 6: Cleaning up old Reasoning Engine ($OLD_AGENT_ID)..."
-    OLD_RESOURCE_NAME=$(get_agent_resource_name "$OLD_AGENT_ID")
-
+# Delete EVERY same-name engine except the one we just deployed and
+# verified. Runs only after the Step 3 verification gate and the Firestore
+# repoint, so the fallback is never deleted before the new engine is live.
+DELETED_ENGINES=""
+if [[ -n "${OLD_AGENT_IDS:-}" ]]; then
+    log "Step 6: Cleaning up old Reasoning Engine(s)..."
     ACCESS_TOKEN=$(gcloud auth print-access-token)
-    if curl -s -X DELETE \
-        "https://${REGION}-aiplatform.googleapis.com/v1beta1/${OLD_RESOURCE_NAME}?force=true" \
-        -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-        -H "Content-Type: application/json" \
-        | grep -q '"done": true'; then
-        ok "Old Reasoning Engine deleted: $OLD_RESOURCE_NAME"
-    else
-        warn "Could not auto-delete old Reasoning Engine $OLD_RESOURCE_NAME — delete it manually if not needed."
-    fi
-else
+    for OLD_ID in $OLD_AGENT_IDS; do
+        if [[ "$OLD_ID" == "$NEW_AGENT_ID" ]]; then
+            continue
+        fi
+        OLD_RESOURCE_NAME=$(get_agent_resource_name "$OLD_ID")
+        if curl -s -X DELETE \
+            "https://${REGION}-aiplatform.googleapis.com/v1beta1/${OLD_RESOURCE_NAME}?force=true" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            | grep -q '"done": true'; then
+            ok "Old Reasoning Engine deleted: $OLD_RESOURCE_NAME"
+            DELETED_ENGINES="${DELETED_ENGINES}${OLD_RESOURCE_NAME} "
+        else
+            warn "Could not auto-delete old Reasoning Engine $OLD_RESOURCE_NAME — delete it manually if not needed."
+        fi
+    done
+fi
+if [[ -z "$DELETED_ENGINES" ]]; then
     log "Step 6: No old Reasoning Engine to clean up."
 fi
 
@@ -404,8 +448,8 @@ echo "==========================================================="
 echo "  Agent:        $AGENT_DISPLAY_NAME"
 echo "  New engine:   $NEW_RESOURCE_NAME"
 echo "  The Forum:    Updated in Firestore (project=$FORUM_PROJECT_ID)"
-if [[ -n "${OLD_AGENT_ID:-}" && "$OLD_AGENT_ID" != "$NEW_AGENT_ID" ]]; then
-    echo "  Old engine:   Deleted ($(get_agent_resource_name "$OLD_AGENT_ID"))"
+if [[ -n "$DELETED_ENGINES" ]]; then
+    echo "  Old engine(s): Deleted (${DELETED_ENGINES% })"
 fi
 echo
 echo "  Test it by sending a DM to your bot on one of its enabled platforms."
