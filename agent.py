@@ -21,6 +21,7 @@ from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 from google.adk.tools.agent_tool import AgentTool  # noqa: F401
 
+from .comites_standard import magister_instruction
 from .custom_functions import (
     add_reminder,
     add_vehicle,
@@ -39,11 +40,12 @@ from .custom_functions import (
     weekly_check,
 )
 
-# --- Scheduler MCP toolset ---
+# --- Forum MCP toolsets (scheduler + agent-to-agent) ---
 # Enabled in terraform (Section 6) with the API key provisioned from The
-# Forum (see FOR_AGENT_DEVELOPERS.md §"Scheduler MCP Server"). The trailing
-# slash on the URL matters — FastAPI 307-redirects POST → GET on the bare
-# path and silently breaks the MCP handshake.
+# Forum (see FOR_AGENT_DEVELOPERS.md §"Scheduler MCP Server"). The same key
+# authenticates both servers. The trailing slash on each URL matters —
+# FastAPI 307-redirects POST → GET on the bare path and silently breaks the
+# MCP handshake.
 from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StreamableHTTPConnectionParams
 
 from .secret_utilities import get_secret_from_secret_manager
@@ -63,10 +65,22 @@ def _load_scheduler_mcp_key() -> str:
     return get_secret_from_secret_manager(project_id, SCHEDULER_MCP_KEY_SECRET_ID)
 
 
+_mcp_key = _load_scheduler_mcp_key()
+
 scheduler_toolset = MCPToolset(
     connection_params=StreamableHTTPConnectionParams(
         url=f"{os.environ['FORUM_URL']}/api/v1/mcp/scheduler/",
-        headers={"X-API-Key": _load_scheduler_mcp_key()},
+        headers={"X-API-Key": _mcp_key},
+    ),
+)
+
+# Agent-to-agent (A2A) tools: query_agent / get_agent_inquiries etc. Used to
+# route shared-asset writes through the Magister and to answer standard
+# inquiries (see comites_standard.py). Same key as the scheduler.
+agents_toolset = MCPToolset(
+    connection_params=StreamableHTTPConnectionParams(
+        url=f"{os.environ['FORUM_URL']}/api/v1/mcp/agents/",
+        headers={"X-API-Key": _mcp_key},
     ),
 )
 
@@ -180,7 +194,11 @@ root_agent = Agent(
         'for each of your vehicles, reading receipts you photograph or upload '
         'and keeping a per-car record in Google Drive.'
     ),
-    instruction=MIKE_INSTRUCTION,
+    # magister_instruction() appends the standard Comites capability suite
+    # (focus_items, review_idea, write-via-Magister rule) when
+    # MAGISTER_DISPLAY_NAME is set; unset, it returns "" and Mike runs
+    # standalone exactly as before.
+    instruction=MIKE_INSTRUCTION + magister_instruction(),
     tools=[
         # Persistent memory (Google Doc).
         FunctionTool(get_agent_memory),
@@ -207,5 +225,9 @@ root_agent = Agent(
 
         # Scheduled reminders via The Forum's hosted MCP server.
         scheduler_toolset,
+
+        # Agent-to-agent messaging via The Forum (Magister coordination and
+        # standard inquiries).
+        agents_toolset,
     ],
 )

@@ -1,0 +1,32 @@
+{
+  "_readme": [
+    "Inquiries Mike publishes to The Forum's A2A register (read by other agents via get_agent_inquiries).",
+    "register_agent.py publishes this file's 'description' and 'inquiries' at deploy time; this _readme key is ignored.",
+    "Entries marked \"standard\": true are the Magister capability suite (see comites_standard.py). They are published",
+    "ONLY when MAGISTER_DISPLAY_NAME is set in .env — a deployment without a Magister publishes none of them.",
+    "Mike deliberately carries only focus_items and review_idea. NO goal_progress and NO daily_metric: his data is",
+    "event-based (services, receipts, odometer readings when someone mentions them) — there is no per-day metric or",
+    "goal-progress signal he could honestly score, and an honest register beats a full one.",
+    "Pruning here prunes the prompt too: comites_standard.py reads this file at runtime (it ships in the deploy",
+    "bundle) and only teaches the standard inquiries still present.",
+    "Contract atomicity: standard request/response formats must match comites_standard.STANDARD_CONTRACTS verbatim —",
+    "register_agent.py fails the deploy on drift."
+  ],
+  "description": "Mike the Mechanic — the household's mechanic. Keeps per-vehicle maintenance records in Google Drive: service history from receipts, odometer readings, insurance and registration paperwork, and reminders for what's coming due.",
+  "inquiries": [
+    {
+      "standard": true,
+      "name": "focus_items",
+      "description": "Vehicle items needing attention today or this week, adapted from the weekly check's typed findings (overdue/due reminders, expiring or expired insurance and registration, stale odometer, missing documents). Conviction maps mechanically to the finding: expired registration or insurance is 9-10; a reminder still ~55 days out is 2-3.",
+      "request_format": "AGENT_QUERY: focus_items | horizon=<today|week> | today=<YYYY-MM-DD> | context=<optional trip/calendar hints>",
+      "response_format": "FOCUS: none — or 1-3 lines of: FOCUS: item=<action> conviction=<1-10> | why=<deadline or goal linkage>"
+    },
+    {
+      "standard": true,
+      "name": "review_idea",
+      "description": "Votes on vehicle-adjacent ideas only — a proposed trip earns an objection if an oil change is nearly due or a document is about to expire on the car that would make it. Ideas with no vehicle angle get an abstention.",
+      "request_format": "AGENT_QUERY: review_idea | idea=<free text> | context=<optional>",
+      "response_format": "IDEA_REVIEW: verdict=<for|against|abstain> conviction=<1-10> | reason=<one sentence>"
+    }
+  ]
+}

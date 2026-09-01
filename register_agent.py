@@ -32,6 +32,7 @@ directly if you're testing the registration step in isolation.
 """
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -232,6 +233,80 @@ def build_platforms(tfvars: dict, sm_client) -> tuple[list[dict], dict]:
     return platforms, legacy
 
 
+def load_inquiries() -> dict:
+    """Load the agent's published inquiries from inquiries.json (if present).
+
+    The file declares what other agents can ping this agent about via The
+    Forum's A2A MCP server (/api/v1/mcp/agents/):
+      {"description": "<what this agent does>",
+       "inquiries": [{"name", "description", "request_format", "response_format"}, ...]}
+
+    Entries flagged "standard": true belong to the Magister capability suite
+    (comites_standard.py) and are published ONLY when MAGISTER_DISPLAY_NAME
+    is set in the environment (deploy_and_update.sh exports .env) — a
+    deployment without a Magister publishes none of them. The "standard"
+    flag itself (and any other extra keys) is stripped before publishing:
+    The Forum's AgentInquiry model knows only the four fields above.
+
+    Returns {} when nothing is publishable — inquiries are optional. The
+    update path in main() retracts a previously published "inquiries" field
+    when this returns none (so flipping the gate off, or pruning, actually
+    unpublishes on the next deploy); a previously published "description"
+    is deliberately left in place, since descriptions may be maintained by
+    hand in Firestore.
+    """
+    path = Path(__file__).parent / "inquiries.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        sys.exit(f"  [x] inquiries.json is not valid JSON: {e}")
+
+    magister = os.environ.get("MAGISTER_DISPLAY_NAME", "").strip()
+    required = ("name", "description", "request_format", "response_format")
+    published, skipped = [], []
+    for inq in data.get("inquiries", []):
+        name = inq.get("name", "<unnamed>")
+        if inq.get("standard") and not magister:
+            skipped.append(name)
+            continue
+        missing = [k for k in required if not inq.get(k)]
+        if missing:
+            sys.exit(f"  [x] inquiries.json entry '{name}' is missing required "
+                     f"field(s): {', '.join(missing)}")
+        # Any entry whose NAME is a standard contract must match
+        # comites_standard.STANDARD_CONTRACTS verbatim (contract
+        # atomicity) — hard-fail the deploy on drift. Keyed on the name
+        # rather than the "standard" flag, so an entry that loses its flag
+        # (or a hand-added duplicate) still gets checked.
+        try:
+            from comites_standard import STANDARD_CONTRACTS
+        except ImportError:
+            STANDARD_CONTRACTS = {}
+        contract = STANDARD_CONTRACTS.get(name)
+        if contract:
+            for field in ("request_format", "response_format"):
+                if inq[field] != contract[field]:
+                    sys.exit(
+                        f"  [x] inquiries.json entry '{name}' has drifted from "
+                        f"comites_standard.STANDARD_CONTRACTS ({field} differs). "
+                        "Update both in the same commit.")
+        published.append({k: inq[k] for k in required})
+
+    out = {}
+    if data.get("description"):
+        out["description"] = data["description"]
+    if published:
+        out["inquiries"] = published
+        print(f"  [OK] Inquiries:   {', '.join(i['name'] for i in published)}")
+    if skipped:
+        print(f"  [!] Standard inquiries skipped (no MAGISTER_DISPLAY_NAME set): "
+              f"{', '.join(skipped)}")
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description="Register agent in The Forum's Firestore with auto-detected platforms")
     parser.add_argument("--agent-name", required=True,
@@ -270,12 +345,14 @@ def main():
     query = db.collection("agents").where("display_name", "==", args.agent_name).limit(1)
     existing = list(query.stream())
 
+    inquiry_fields = load_inquiries()
     agent_data = {
         "display_name": args.agent_name,
         "vertex_ai_agent_id": args.vertex_ai_agent_id,
         "platforms": platforms,
         "accepted_file_types": ACCEPTED_FILE_TYPES,
         "updated_at": datetime.now(timezone.utc),
+        **inquiry_fields,
         **legacy,
     }
 
@@ -285,6 +362,14 @@ def main():
         # Phase out plaintext slack_bot_token written by older deploy paths.
         # Secret references in the platforms array are the supported path.
         update_data["slack_bot_token"] = firestore.DELETE_FIELD
+        # Retract previously published inquiries when this deploy publishes
+        # none (Magister gate turned off, or inquiries pruned away) — other
+        # agents must not keep discovering contracts this agent no longer
+        # implements. A no-op for docs that never had the field. The
+        # "description" field is deliberately NOT retracted: it may be
+        # maintained by hand in Firestore.
+        if "inquiries" not in inquiry_fields:
+            update_data["inquiries"] = firestore.DELETE_FIELD
         db.collection("agents").document(doc_id).update(update_data)
         print(f"\n[OK] Updated existing agent doc: {doc_id}")
     else:
