@@ -1,3 +1,6 @@
 {
-  "service_account": "mike-the-mechanic@mike-the-mechanic-prod.iam.gserviceaccount.com"
+  "service_account": "mike-the-mechanic@mike-the-mechanic-prod.iam.gserviceaccount.com",
+  "extra_packages": [
+    "inquiries.json"
+  ]
 }

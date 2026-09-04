@@ -29,9 +29,22 @@ a message in these formats. This module only provides the format strings and
 lightweight parsers (used mainly by Magister-side code and tests).
 """
 import json
+import logging
 import os
 import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Resolved at import so a relative __file__ or a later os.chdir can never
+# break the inquiries.json lookup. The deployed Agent Engine bundle ships
+# Python files but DROPS non-code files from the package dir (observed in
+# production 2026-09-03: /app/agents/<pkg>/inquiries.json absent while the
+# module loaded fine) — inquiries.json therefore ships via extra_packages
+# in .agent_engine_config.json, which lands it at the app ROOT. Search a
+# small candidate list so both layouts (and local dev) work.
+_MODULE_DIR = Path(__file__).resolve().parent
+_INQUIRY_DIRS = [_MODULE_DIR, *list(_MODULE_DIR.parents)[:3], Path.cwd()]
 
 # ---------------------------------------------------------------------------
 # Conviction scale — quoted verbatim in every agent's instruction so a "7"
@@ -140,10 +153,31 @@ def published_standard_inquiries() -> list:
     unreadable — the fragment then teaches no standard inquiries but keeps
     the write-via-Magister rule.
     """
-    try:
-        with open(Path(__file__).parent / "inquiries.json", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
+    data = None
+    tried = []
+    for base in _INQUIRY_DIRS:
+        path = base / "inquiries.json"
+        tried.append(str(path))
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            break
+        except OSError:
+            continue
+        except ValueError as e:
+            logger.warning(
+                "comites_standard: %s exists but is not valid JSON (%r)",
+                path, e,
+            )
+            return []
+    if data is None:
+        # An unreadable register file silently disables the standard-inquiry
+        # section of the instruction — make that state LOUD in the logs.
+        logger.warning(
+            "comites_standard: inquiries.json not found (tried: %s) — the "
+            "Magister instruction fragment will teach NO standard inquiries "
+            "this process", ", ".join(tried),
+        )
         return []
     return [
         inq.get("name") for inq in data.get("inquiries", [])
