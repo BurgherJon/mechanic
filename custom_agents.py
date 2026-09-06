@@ -13,7 +13,7 @@ Pattern:
     import os
 
     google_search_agent = Agent(
-        model=os.environ.get('QUICK_AGENT_MODEL', 'gemini-3-flash-preview'),
+        model=specialist_model(),  # from .model_utils; Gemini only if it needs google_search
         name='google_search_agent',
         description='Performs Google searches and returns relevant results.',
         instruction='Search the web for the user query and return the most relevant results.',

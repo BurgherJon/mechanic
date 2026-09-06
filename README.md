@@ -104,7 +104,7 @@ Edit [`agent.py`](agent.py):
 
 - Replace `STUB_INSTRUCTION` with the system prompt that defines your agent's persona, the tasks it handles, and how it should call tools.
 - Update the `description` field — that's what shows up if another agent ever uses yours as a sub-agent, and it's what registration writes to Firestore.
-- Pick the model that fits the work. `HIGH_QUALITY_AGENT_MODEL` in `.env` is what `root_agent` uses by default; `QUICK_AGENT_MODEL` is the convention for cheaper sub-agents.
+- Pick the model that fits the work. `HIGH_QUALITY_AGENT_MODEL` in `.env` is what `root_agent` uses (Claude via `model_utils.py`); `SPECIALIST_AGENT_MODEL` is the convention for sub-agents and is the root's backup; `VISION_MODEL` covers the direct Gemini vision call.
 
 ### 2. Use the persistent memory that's already wired up
 

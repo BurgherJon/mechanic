@@ -11,17 +11,19 @@ tools are in custom_functions.py.
 """
 import os
 
-# Force model API calls to the `global` endpoint so preview models (e.g.
-# `gemini-3.1-pro-preview`) are accessible even when the Agent Engine itself
-# is deployed in a regional location like us-central1. Safe to leave on for
-# non-preview models too.
+# Force Gemini API calls to the `global` endpoint even though the Agent Engine
+# deploys regionally. Claude goes to the first-party Anthropic API and ignores
+# this; the direct vision call (VISION_MODEL) still needs it.
 os.environ['GOOGLE_CLOUD_LOCATION'] = 'global'
 
 from google.adk.agents import Agent
+from google.adk.agents.context_cache_config import ContextCacheConfig
+from google.adk.apps import App
 from google.adk.tools import FunctionTool
 from google.adk.tools.agent_tool import AgentTool  # noqa: F401
 
 from .comites_standard import magister_instruction
+from .model_utils import high_quality_config, high_quality_model
 from .custom_functions import (
     add_reminder,
     add_vehicle,
@@ -187,7 +189,10 @@ MIKE_INSTRUCTION = (
 
 
 root_agent = Agent(
-    model=os.environ.get('HIGH_QUALITY_AGENT_MODEL', 'gemini-3.1-pro-preview'),
+    # Claude via the first-party Anthropic API (model_utils.py); Mike runs the
+    # specialist-tier model (claude-sonnet-5) as his root per the fleet roster.
+    model=high_quality_model(),
+    generate_content_config=high_quality_config("medium"),
     name='root_agent',
     description=(
         'Mike the Mechanic — tracks maintenance, repairs, and routine service '
@@ -230,4 +235,14 @@ root_agent = Agent(
         # standard inquiries).
         agents_toolset,
     ],
+)
+
+
+# App wrapper: turns on prompt caching for the Claude root (tools + system
+# instruction + conversation prefix bill at the cache-read rate after the
+# first turn). The Agent Engine loader prefers `app` over `root_agent`.
+app = App(
+    name="mechanic",
+    root_agent=root_agent,
+    context_cache_config=ContextCacheConfig(min_tokens=2048),
 )

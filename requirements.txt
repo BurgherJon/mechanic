@@ -26,6 +26,10 @@ google-genai
 # dep can change under you between deploys — if a deploy suddenly breaks with no
 # code change, suspect a dependency bump first and check the engine build log for
 # versions.
-google-adk[a2a]
+# Pinned: the engine must run the ADK this code was verified against (2.8.0
+# ships AnthropicLlm with client=, effort, and prompt caching).
+google-adk[a2a]==2.8.0
+# Claude via the first-party Anthropic API (model_utils.py).
+anthropic==1.4.0
 mcp>=1.5,<2
 google-cloud-storage

@@ -369,6 +369,7 @@ resource "google_storage_bucket_iam_member" "engine_inbound_files_reader" {
 locals {
   forum_runtime_roles_for_agent_sa = toset([
     "roles/aiplatform.user",         # invoke Vertex AI APIs at runtime
+    "roles/serviceusage.serviceUsageConsumer", # aiplatform initializer resolves the Forum project by number at startup; without this every engine logs a 403 USER_PROJECT_DENIED traceback
     "roles/logging.logWriter",       # emit stdout/stderr to Cloud Logging
     "roles/monitoring.metricWriter", # emit container metrics
     "roles/cloudtrace.agent",        # emit traces. NOTE: --trace_to_cloud was removed from deploy_and_update.sh (commit b5adf67) because it triggers a metadata-proxy scope bug with cross-project SAs. We keep this role granted so re-enabling tracing later is a one-line change; remove if you've decided you'll never use it.
@@ -616,4 +617,32 @@ output "staging_bucket" {
 output "forum_runtime_sa" {
   description = "The Forum's Cloud Run service account (the principal granted secretAccessor on this agent's platform secrets)"
   value       = local.forum_runtime_sa
+}
+
+# ==============================================================================
+# SECTION 8: MODEL-PROVIDER KEY (Anthropic)
+#
+# The root agent runs Claude through the first-party Anthropic API
+# (model_utils.py builds ADK's AnthropicLlm with this key). Only the per-agent
+# SA reads it. Add the value after `terraform apply`:
+#   printf '%s' "sk-ant-..." | gcloud secrets versions add \
+#     ${var.bot_account_id}-anthropic-key --data-file=- --project=${var.project_id}
+# ==============================================================================
+
+resource "google_secret_manager_secret" "anthropic_api_key" {
+  project   = var.project_id
+  secret_id = "${var.bot_account_id}-anthropic-key"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.secretmanager]
+}
+
+resource "google_secret_manager_secret_iam_member" "anthropic_api_key_agent_accessor" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.anthropic_api_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.agent.email}"
 }

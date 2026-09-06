@@ -391,15 +391,15 @@ def read_uploaded_file(gcs_uri: str, mime_type: str, purpose: str = "receipt") -
     prompt = prompts.get(purpose, "Describe this document and transcribe any text it contains.")
 
     try:
-        client = genai.Client()
-        response = client.models.generate_content(
-            model=os.environ.get("HIGH_QUALITY_AGENT_MODEL", "gemini-3.1-pro-preview"),
-            contents=[types.Content(role="user", parts=[
-                types.Part.from_bytes(data=data, mime_type=mime_type),
-                types.Part.from_text(text=prompt),
-            ])],
-        )
-        return {"extracted": (response.text or "").strip(),
+        from .model_utils import generate_vision
+
+        # VISION_MODEL (Gemini, global endpoint) with transient retry —
+        # deliberately decoupled from the root agent's Claude model.
+        extracted = generate_vision([
+            types.Part.from_bytes(data=data, mime_type=mime_type),
+            types.Part.from_text(text=prompt),
+        ])
+        return {"extracted": extracted,
                 "gcs_uri": gcs_uri, "mime_type": mime_type}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Could not read the file: {exc}"}
