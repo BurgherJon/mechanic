@@ -339,11 +339,30 @@ if target_id not in live_ids:
     print(f'NOT_FOUND: engine {target_id} is not in the live engine list (deploy likely failed and was auto-deleted)')
     sys.exit(1)
 
-# 2) Liveness: it must actually create a session.
+# 2) Liveness: it must actually create a session. The Agent Engine Sessions
+#    API in the Forum project throttles session creation (429 RESOURCE_EXHAUSTED
+#    on the third call within seconds, plus intermittent 500 INTERNAL) — three
+#    Maggie deploys on 2026-09-06 died here on a healthy engine. Retry the
+#    transient cases with backoff before declaring the engine dead.
+import time
 agent = reasoning_engines.ReasoningEngine(resource_name)
-session = agent.create_session(user_id='smoke-test')
-print(f'Session created: {session[\"id\"]}')
-print('VERIFIED_OK')
+transient_markers = ('429', 'RESOURCE_EXHAUSTED', '500', 'INTERNAL',
+                     '503', 'UNAVAILABLE', 'Internal Server Error')
+for attempt in range(1, 7):
+    try:
+        session = agent.create_session(user_id='smoke-test')
+        print(f'Session created: {session[\"id\"]} (attempt {attempt})')
+        print('VERIFIED_OK')
+        break
+    except Exception as e:
+        msg = str(e)
+        transient = any(m in msg for m in transient_markers)
+        if not transient or attempt == 6:
+            print(f'SESSION_CREATE_FAILED after {attempt} attempt(s): {msg[:400]}')
+            sys.exit(1)
+        wait = 15 * attempt
+        print(f'Transient session-create failure (attempt {attempt}): {msg[:120]} -- retrying in {wait}s')
+        time.sleep(wait)
 " 2>&1) || true
 
 if echo "$VERIFY_RESULT" | grep -q "VERIFIED_OK"; then
