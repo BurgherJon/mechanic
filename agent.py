@@ -19,6 +19,7 @@ os.environ['GOOGLE_CLOUD_LOCATION'] = 'global'
 from google.adk.agents import Agent
 from google.adk.agents.context_cache_config import ContextCacheConfig
 from google.adk.apps import App
+from google.adk.apps.app import EventsCompactionConfig
 from google.adk.tools import FunctionTool
 from google.adk.tools.agent_tool import AgentTool  # noqa: F401
 
@@ -244,5 +245,16 @@ root_agent = Agent(
 app = App(
     name="mechanic",
     root_agent=root_agent,
+    # Event compaction: fold older turns into a summary so the per-turn session
+    # read (and the event history replayed to the model) stops growing all day.
+    # Sliding window every 10 user turns keeping 2 for continuity, plus a
+    # token-based trigger for turns whose tool output is huge (a cellar or
+    # inventory dump). Fewer, smaller Sessions API reads is the point.
+    events_compaction_config=EventsCompactionConfig(
+        compaction_interval=10,
+        overlap_size=2,
+        token_threshold=60000,
+        event_retention_size=10,
+    ),
     context_cache_config=ContextCacheConfig(min_tokens=2048),
 )
