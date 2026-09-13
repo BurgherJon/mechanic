@@ -154,6 +154,78 @@ def _is_transient(exc: BaseException) -> bool:
 # The wrapper
 # ---------------------------------------------------------------------------
 
+_INTERRUPTED_RESULT: Dict[str, Any] = {
+    "error": (
+        "interrupted: no result was recorded for this call (platform timeout "
+        "or cutoff). Treat its side effects as unconfirmed and re-check before "
+        "assuming they happened."
+    )
+}
+
+
+def heal_orphaned_tool_calls(contents: List[types.Content]) -> int:
+    """Insert a synthetic function_response for every function_call that
+    never got one, so a cut-off turn cannot poison the whole session.
+
+    Found live on 2026-09-09: the platform cut a turn off after the
+    function_call event was persisted but before the tool replied. Every
+    later turn replayed that history and Anthropic rejected it (`tool_use`
+    without a `tool_result`), on primary and backup alike, until the session
+    was reset. ADK already moves each function_response to sit right after
+    its call, so by the time contents reach the model any call still
+    unanswered is a true orphan.
+
+    Mutates `contents` in place. If the content right after the orphaned
+    call already carries function responses (a sibling call that DID get
+    answered), the synthetic result is added to that content — Anthropic
+    requires every tool_use of a message to be answered in the very next
+    message. Calls without an id (some Gemini histories) cannot be matched
+    and are left alone. Returns the number of calls healed.
+    """
+    answered = set()
+    for content in contents:
+        for part in content.parts or []:
+            if part.function_response is not None and part.function_response.id:
+                answered.add(part.function_response.id)
+
+    healed = 0
+    i = 0
+    while i < len(contents):
+        orphans = [
+            part.function_call
+            for part in (contents[i].parts or [])
+            if part.function_call is not None
+            and part.function_call.id
+            and part.function_call.id not in answered
+        ]
+        if orphans:
+            parts = [
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id=call.id, name=call.name, response=dict(_INTERRUPTED_RESULT)
+                    )
+                )
+                for call in orphans
+            ]
+            nxt = contents[i + 1] if i + 1 < len(contents) else None
+            if nxt is not None and any(
+                p.function_response is not None for p in (nxt.parts or [])
+            ):
+                nxt.parts = list(nxt.parts or []) + parts
+            else:
+                contents.insert(i + 1, types.Content(role="user", parts=parts))
+                i += 1
+            for call in orphans:
+                answered.add(call.id)
+                logger.warning(
+                    "Healed orphaned tool call %s (id=%s): no result was recorded",
+                    call.name, call.id,
+                )
+            healed += len(orphans)
+        i += 1
+    return healed
+
+
 class ResilientLlm(BaseLlm):
     """Non-streaming, retrying, per-event-loop wrapper with a backup model.
 
@@ -247,6 +319,11 @@ class ResilientLlm(BaseLlm):
     ):
         primary_error: Optional[BaseException] = None
         responses: List[LlmResponse] = []
+        # A call the platform cut off before its result was recorded would
+        # otherwise be rejected by the provider on every later turn. Healed
+        # once here, so primary and backup both see a clean history.
+        if llm_request.contents:
+            heal_orphaned_tool_calls(llm_request.contents)
         try:
             responses = await self._collect(self.primary_model, llm_request)
             if not self._is_degenerate(responses):
