@@ -1,20 +1,21 @@
-"""Model construction for Maggie: Claude on the first-party Anthropic API,
-Gemini for the direct vision helpers, and one resilience wrapper around
-either.
+"""Model construction: Gemini on Vertex AI through ADK's native `Gemini`
+class, behind one resilience wrapper.
 
-Fleet standard (2026-09-06, see the Comites Model Roster):
+Defaults (2026-09-28; override in .env):
 
-    HIGH_QUALITY_AGENT_MODEL   claude-opus-5     root orchestrator
-    SPECIALIST_AGENT_MODEL     claude-sonnet-5   sub-agents; also the root's backup
-    VISION_MODEL               gemini-3.8-flash  direct genai extraction calls
-    ANTHROPIC_SECRET_NAME      {BOT_ACCOUNT_ID}-anthropic-key in AGENT_PROJECT_ID
+    HIGH_QUALITY_AGENT_MODEL   gemini-3.1-pro-preview  root orchestrator
+    SPECIALIST_AGENT_MODEL     gemini-3.8-flash        sub-agents; also the root's backup
+    VISION_MODEL               gemini-3.8-flash        direct genai extraction calls
+    SEARCH_AGENT_MODEL         gemini-3.8-flash        sub-agents using google_search/url_context
+
+Gemini 3.1 Pro is served on Vertex only under its preview id and only on
+the `global` endpoint, which agent.py forces before the Google imports.
+No API key: the engine calls Vertex as its own service account.
 
 Rules this module encodes, each learned in production:
 
-1. Never hand a bare "claude-*" string to Agent(model=...). ADK's registry
-   maps those to its Vertex `Claude` class, and this estate has no Claude
-   quota on Vertex. Claude is built explicitly as `AnthropicLlm` with a
-   client that carries the first-party API key from Secret Manager.
+1. Never hand a bare model string to Agent(model=...). Every model goes
+   through a factory here so the wrapper below is always in the path.
 2. Never subclass ADK model internals (Sam's June-2026 TypeError came from
    a subclass written against an older ADK). Everything here composes at
    the `BaseLlm` boundary, which is a stable public contract.
@@ -26,9 +27,24 @@ Rules this module encodes, each learned in production:
    that use MCP toolsets, and the Forum consumes the full stream before
    delivering anyway, so nothing is lost.
 5. Retry transient serving errors (429 / 500 / 503 / 529) before failing a
-   turn, then fall back to the backup model on an exception or an empty
-   final response. An empty final response is also how a Claude refusal
-   surfaces through ADK, so the backup absorbs that case too.
+   turn. An empty final response (no text, no tool call) gets one retry of
+   the primary after a short pause, because a mid-turn change of model is
+   worse than a fluke. Only then the backup, and the backup runs UNCACHED:
+   ADK's context cache rewrites the request in place for the model that
+   owns the cache, and Vertex refuses that cache for another model with
+   400 "model in the inference request does not match the model in the
+   cached content". So the request is snapshotted before the first call
+   and restored before every further call, and the backup's copy carries
+   no cache at all.
+6. Heal orphaned tool calls before every model call, so a turn the
+   platform cut off cannot poison the rest of the session.
+7. Before every model call, drop thought parts left by the Claude era and
+   stamp unsigned function calls with Gemini's dummy thought signature.
+   Gemini 3 rejects a foreign signature ("Invalid thought signature", seen
+   2026-09-28 on 3.8 Flash; 3.1 Pro rejects Claude's redacted thinking)
+   and validates a signature on every function call in the current turn.
+8. Log one `model usage` line per completed call with the prompt, cached,
+   thought and output token counts.
 """
 import asyncio
 import logging
@@ -42,23 +58,32 @@ from google.genai import types
 from pydantic import PrivateAttr
 from typing_extensions import override
 
-from .secret_utilities import get_secret_from_secret_manager
-
 logger = logging.getLogger(__name__)
 
-DEFAULT_HIGH_QUALITY_MODEL = "claude-opus-5"
-DEFAULT_SPECIALIST_MODEL = "claude-sonnet-5"
+DEFAULT_HIGH_QUALITY_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_SPECIALIST_MODEL = "gemini-3.8-flash"
 DEFAULT_VISION_MODEL = "gemini-3.8-flash"
+# Sub-agents that use ADK's google_search / url_context are gated to Gemini.
+DEFAULT_SEARCH_MODEL = "gemini-3.8-flash"
+DEFAULT_SEARCH_BACKUP_MODEL = "gemini-3.5-flash"
 
-# Output cap for every Claude agent. These calls are non-streaming, so the
-# cap must leave the response inside the HTTP request timeout; 16384 covers
-# the longest outputs in the estate (Sam's ~4000-word memory rewrite).
-CLAUDE_MAX_OUTPUT_TOKENS = 16384
+# Output cap for every agent. These calls are non-streaming, so the cap must
+# leave the response inside the HTTP request timeout; 16384 covers the
+# longest outputs in the estate (Sam's ~4000-word memory rewrite).
+MAX_OUTPUT_TOKENS = 16384
+
+# An agent's `effort` maps onto Gemini's thinking level. Gemini 3.1 Pro
+# takes LOW / MEDIUM / HIGH; 3.8 Flash takes those and MINIMAL.
+_THINKING_LEVELS = {
+    "low": types.ThinkingLevel.LOW,
+    "medium": types.ThinkingLevel.MEDIUM,
+    "high": types.ThinkingLevel.HIGH,
+}
 
 # Substrings that mark a transient serving failure worth retrying. Matched
-# against str(exception) because Anthropic, google-genai and httpx each raise
-# their own types. 500/INTERNAL were absent before 2026-09-06 and let a
-# transient Vertex 500 kill a deploy verification.
+# against str(exception) because google-genai and httpx each raise their own
+# types. 500/INTERNAL were absent before 2026-09-06 and let a transient
+# Vertex 500 kill a deploy verification.
 _RETRYABLE_MARKERS = (
     "429", "RESOURCE_EXHAUSTED", "rate_limit",
     "500", "INTERNAL",
@@ -66,9 +91,9 @@ _RETRYABLE_MARKERS = (
     "529", "overloaded", "Overloaded",
 )
 _RETRY_ATTEMPTS = 3
+# Pause before the one retry of a primary that returned an empty final response.
+_DEGENERATE_RETRY_PAUSE_SECONDS = 2.0
 _INNER_CACHE_CAP = 8
-
-_secret_cache: Dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -87,25 +112,30 @@ def vision_model_id() -> str:
     return os.environ.get("VISION_MODEL", DEFAULT_VISION_MODEL)
 
 
-def is_claude(model_id: str) -> bool:
-    return model_id.startswith("claude-")
+def search_model_id() -> str:
+    return os.environ.get("SEARCH_AGENT_MODEL", DEFAULT_SEARCH_MODEL)
+
+
+def _require_gemini(model_id: str) -> str:
+    """Fail at import, not on the first turn, when .env names another provider."""
+    if not model_id.startswith("gemini-"):
+        raise ValueError(
+            f"model {model_id!r}: only Gemini on Vertex AI is wired up. Set "
+            "HIGH_QUALITY_AGENT_MODEL / SPECIALIST_AGENT_MODEL / "
+            "SEARCH_AGENT_MODEL in .env to a gemini-* id."
+        )
+    return model_id
 
 
 def _agent_config(model_id: str, effort: Optional[str]) -> types.GenerateContentConfig:
-    """Per-agent generation config for the given model.
-
-    Claude gets the effort level (adaptive thinking is on by default on
-    Claude 5 models, so nothing else is needed) plus the output cap. Any
-    other model gets a plain config, because the Anthropic subclass carries
-    an `effort` field Gemini would reject.
-    """
-    if is_claude(model_id):
-        from google.adk.models.anthropic_llm import AnthropicGenerateContentConfig
-
-        return AnthropicGenerateContentConfig(
-            effort=effort, max_output_tokens=CLAUDE_MAX_OUTPUT_TOKENS
-        )
-    return types.GenerateContentConfig()
+    """Per-agent generation config: the output cap and the thinking level."""
+    _require_gemini(model_id)
+    thinking = None
+    if effort:
+        thinking = types.ThinkingConfig(thinking_level=_THINKING_LEVELS[effort])
+    return types.GenerateContentConfig(
+        max_output_tokens=MAX_OUTPUT_TOKENS, thinking_config=thinking
+    )
 
 
 def high_quality_config(effort: str = "high") -> types.GenerateContentConfig:
@@ -120,29 +150,10 @@ def specialist_config(effort: str = "medium") -> types.GenerateContentConfig:
 # Inner model construction
 # ---------------------------------------------------------------------------
 
-def _anthropic_api_key() -> str:
-    if "anthropic" not in _secret_cache:
-        project = os.environ.get("AGENT_PROJECT_ID") or os.environ["GOOGLE_CLOUD_PROJECT"]
-        secret = os.environ.get("ANTHROPIC_SECRET_NAME") or (
-            f"{os.environ['BOT_ACCOUNT_ID']}-anthropic-key"
-        )
-        _secret_cache["anthropic"] = get_secret_from_secret_manager(project, secret)
-    return _secret_cache["anthropic"]
-
-
-def _build_inner(model_id: str, max_tokens: int) -> BaseLlm:
-    if is_claude(model_id):
-        from anthropic import AsyncAnthropic
-        from google.adk.models.anthropic_llm import AnthropicLlm
-
-        return AnthropicLlm(
-            model=model_id,
-            max_tokens=max_tokens,
-            client=AsyncAnthropic(api_key=_anthropic_api_key()),
-        )
+def _build_inner(model_id: str) -> BaseLlm:
     from google.adk.models.google_llm import Gemini
 
-    return Gemini(model=model_id)
+    return Gemini(model=_require_gemini(model_id))
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -151,7 +162,7 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# The wrapper
+# History repair, applied before every model call
 # ---------------------------------------------------------------------------
 
 _INTERRUPTED_RESULT: Dict[str, Any] = {
@@ -169,18 +180,18 @@ def heal_orphaned_tool_calls(contents: List[types.Content]) -> int:
 
     Found live on 2026-09-09: the platform cut a turn off after the
     function_call event was persisted but before the tool replied. Every
-    later turn replayed that history and Anthropic rejected it (`tool_use`
-    without a `tool_result`), on primary and backup alike, until the session
-    was reset. ADK already moves each function_response to sit right after
-    its call, so by the time contents reach the model any call still
+    later turn replayed that history and the provider rejected it (a tool
+    call without a tool result), on primary and backup alike, until the
+    session was reset. ADK already moves each function_response to sit right
+    after its call, so by the time contents reach the model any call still
     unanswered is a true orphan.
 
     Mutates `contents` in place. If the content right after the orphaned
     call already carries function responses (a sibling call that DID get
-    answered), the synthetic result is added to that content — Anthropic
-    requires every tool_use of a message to be answered in the very next
-    message. Calls without an id (some Gemini histories) cannot be matched
-    and are left alone. Returns the number of calls healed.
+    answered), the synthetic result is added to that content, because a
+    strict provider requires every call of a message to be answered in the
+    very next message. Calls without an id (some Gemini histories) cannot be
+    matched and are left alone. Returns the number of calls healed.
     """
     answered = set()
     for content in contents:
@@ -226,6 +237,128 @@ def heal_orphaned_tool_calls(contents: List[types.Content]) -> int:
     return healed
 
 
+def drop_thought_parts(contents: List[types.Content]) -> int:
+    """Remove every thought part from `contents`, and any content left empty.
+
+    Sessions that ran on Claude hold its thinking blocks as parts with
+    `thought=True` and Claude's signature in `thought_signature`; ADK replays
+    them, and Gemini 3 rejects the signature with 400 "Invalid thought
+    signature", on every later turn of that session. Gemini itself returns
+    thought parts only when `include_thoughts` is on, which nothing here
+    sets; its own signatures ride on function-call and text parts, which
+    are kept. A thought part carrying a function call or response is kept
+    too. Mutates in place; returns the number of parts dropped.
+    """
+    dropped = 0
+    kept_contents: List[types.Content] = []
+    for content in contents:
+        parts = content.parts or []
+        kept = [
+            p for p in parts
+            if not p.thought or p.function_call is not None or p.function_response is not None
+        ]
+        dropped += len(parts) - len(kept)
+        if len(kept) != len(parts):
+            content.parts = kept
+        if kept or not parts:
+            kept_contents.append(content)
+    contents[:] = kept_contents
+    return dropped
+
+
+# Gemini 3 validates a thought signature on every function call in the
+# current turn. A call made by another model (Claude, or an older Gemini)
+# carries none, so the turn is rejected with 400 "Function call is missing a
+# thought_signature". Google's documented escape for history that came from
+# elsewhere is this dummy value, which tells the validator to skip the part.
+SKIP_THOUGHT_SIGNATURE = b"skip_thought_signature_validator"
+
+
+def stamp_thought_signatures(contents: List[types.Content]) -> int:
+    """Give every unsigned function call in `contents` the dummy signature.
+
+    Only model-authored function-call parts without a signature are touched;
+    a real signature is never overwritten and nothing else changes. Mutates
+    in place; returns the number of parts stamped.
+    """
+    stamped = 0
+    for content in contents:
+        if content.role != "model":
+            continue
+        for part in content.parts or []:
+            if part.function_call is not None and not part.thought_signature:
+                part.thought_signature = SKIP_THOUGHT_SIGNATURE
+                stamped += 1
+    return stamped
+
+
+class _RequestSnapshot:
+    """The parts of an `LlmRequest` a Gemini call rewrites in place.
+
+    ADK's context cache manager applies an active cache by stripping the
+    system instruction, tools and tool config from `config`, setting
+    `config.cached_content` and cutting the cached prefix off `contents`;
+    the Gemini model also appends a user content when the history ends on
+    the model's side. A second call on the same object, whether a retry or
+    the backup, must start from the request as the flow built it, so it is
+    captured here before the first call and put back before every later one.
+    """
+
+    def __init__(self, llm_request: LlmRequest):
+        self.contents = list(llm_request.contents or [])
+        self.config = llm_request.config.model_copy() if llm_request.config is not None else None
+        self.cache_config = llm_request.cache_config
+        self.cache_metadata = llm_request.cache_metadata
+        self.cacheable_contents_token_count = llm_request.cacheable_contents_token_count
+
+    def restore(self, llm_request: LlmRequest, *, uncached: bool = False) -> None:
+        """Put the request back; `uncached` also drops every trace of the cache.
+
+        The cache belongs to the model that built it. The backup gets the
+        whole history and its own system instruction and tools, and no
+        `cache_config`, so ADK neither reuses the primary's cache nor tries
+        to build one for a call that runs once in a long while.
+        """
+        llm_request.contents = list(self.contents)
+        llm_request.config = self.config.model_copy() if self.config is not None else None
+        if uncached:
+            llm_request.cache_config = None
+            llm_request.cache_metadata = None
+            llm_request.cacheable_contents_token_count = None
+            if llm_request.config is not None:
+                llm_request.config.cached_content = None
+        else:
+            llm_request.cache_config = self.cache_config
+            llm_request.cache_metadata = self.cache_metadata
+            llm_request.cacheable_contents_token_count = self.cacheable_contents_token_count
+
+
+def usage_line(model_id: str, responses: List[Any]) -> Optional[str]:
+    """One line of token accounting for a completed call, or None.
+
+    Cached tokens are the prompt prefix Vertex served from its cache; a
+    non-zero count on the second turn of a session proves the prefix
+    survived.
+    """
+    usage = None
+    for response in reversed(list(responses)):
+        if getattr(response, "usage_metadata", None) is not None:
+            usage = response.usage_metadata
+            break
+    if usage is None:
+        return None
+    return (
+        f"model usage {model_id}: prompt={usage.prompt_token_count or 0} "
+        f"cached={usage.cached_content_token_count or 0} "
+        f"thoughts={usage.thoughts_token_count or 0} "
+        f"output={usage.candidates_token_count or 0}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The wrapper
+# ---------------------------------------------------------------------------
+
 class ResilientLlm(BaseLlm):
     """Non-streaming, retrying, per-event-loop wrapper with a backup model.
 
@@ -237,7 +370,7 @@ class ResilientLlm(BaseLlm):
 
     primary_model: str
     backup_model: Optional[str] = None
-    max_tokens: int = CLAUDE_MAX_OUTPUT_TOKENS
+    max_tokens: int = MAX_OUTPUT_TOKENS
 
     _inner: Dict[Tuple[Any, str], BaseLlm] = PrivateAttr(default_factory=dict)
 
@@ -246,9 +379,12 @@ class ResilientLlm(BaseLlm):
         *,
         primary_model: str,
         backup_model: Optional[str] = None,
-        max_tokens: int = CLAUDE_MAX_OUTPUT_TOKENS,
+        max_tokens: int = MAX_OUTPUT_TOKENS,
         **kwargs: Any,
     ) -> None:
+        _require_gemini(primary_model)
+        if backup_model:
+            _require_gemini(backup_model)
         super().__init__(
             model=primary_model,
             primary_model=primary_model,
@@ -275,19 +411,36 @@ class ResilientLlm(BaseLlm):
                 # Dead loops leave entries behind; loops are few, so a
                 # small cap bounds growth over a long-lived engine.
                 self._inner.clear()
-            inner = _build_inner(model_id, self.max_tokens)
+            inner = _build_inner(model_id)
             self._inner[key] = inner
         return inner
 
-    async def _collect(self, model_id: str, llm_request: LlmRequest) -> List[LlmResponse]:
-        """Run one complete non-streaming call with transient retry."""
-        llm_request.model = model_id
+    async def _collect(
+        self,
+        model_id: str,
+        llm_request: LlmRequest,
+        snapshot: _RequestSnapshot,
+        *,
+        uncached: bool = False,
+    ) -> List[LlmResponse]:
+        """Run one complete non-streaming call with transient retry.
+
+        Every attempt starts from the snapshot (see `_RequestSnapshot`): the
+        previous attempt may have rewritten the request for its cache.
+        """
         inner = self._inner_for(model_id)
         for attempt in range(_RETRY_ATTEMPTS):
+            snapshot.restore(llm_request, uncached=uncached)
+            llm_request.model = model_id
+            if llm_request.config is not None and llm_request.config.max_output_tokens is None:
+                llm_request.config.max_output_tokens = self.max_tokens
             try:
                 responses: List[LlmResponse] = []
                 async for response in inner.generate_content_async(llm_request, stream=False):
                     responses.append(response)
+                line = usage_line(model_id, responses)
+                if line:
+                    logger.info(line)
                 return responses
             except Exception as exc:  # noqa: BLE001 — inspect, re-raise non-transient
                 if not _is_transient(exc) or attempt == _RETRY_ATTEMPTS - 1:
@@ -319,22 +472,36 @@ class ResilientLlm(BaseLlm):
     ):
         primary_error: Optional[BaseException] = None
         responses: List[LlmResponse] = []
-        # A call the platform cut off before its result was recorded would
-        # otherwise be rejected by the provider on every later turn. Healed
-        # once here, so primary and backup both see a clean history.
+        # Rules 6 and 7: repaired once here, so primary and backup both see
+        # a history Gemini accepts.
         if llm_request.contents:
             heal_orphaned_tool_calls(llm_request.contents)
+            if drop_thought_parts(llm_request.contents):
+                logger.info("Dropped thought parts from a pre-Gemini history")
+            stamp_thought_signatures(llm_request.contents)
+        # Taken after the repair, before any model sees the request.
+        snapshot = _RequestSnapshot(llm_request)
         try:
-            responses = await self._collect(self.primary_model, llm_request)
-            if not self._is_degenerate(responses):
-                for response in responses:
-                    yield response
-                return
-            finish = responses[-1].finish_reason if responses else None
-            logger.warning(
-                "Primary %s returned an empty final response (finish_reason=%s)",
-                self.primary_model, finish,
-            )
+            for attempt in range(2):
+                responses = await self._collect(self.primary_model, llm_request, snapshot)
+                if not self._is_degenerate(responses):
+                    for response in responses:
+                        yield response
+                    return
+                finish = responses[-1].finish_reason if responses else None
+                if attempt == 0:
+                    # Rule 5: an empty STOP is usually a fluke; one more try on
+                    # the model whose voice and judgement the agent is tuned to.
+                    logger.warning(
+                        "Primary %s returned an empty final response (finish_reason=%s); retrying it once",
+                        self.primary_model, finish,
+                    )
+                    await asyncio.sleep(_DEGENERATE_RETRY_PAUSE_SECONDS)
+                else:
+                    logger.warning(
+                        "Primary %s returned an empty final response again (finish_reason=%s)",
+                        self.primary_model, finish,
+                    )
         except Exception as exc:  # noqa: BLE001 — fall through to backup
             primary_error = exc
             logger.warning(
@@ -349,9 +516,9 @@ class ResilientLlm(BaseLlm):
                 yield response
             return
 
-        logger.warning("Falling back to %s", self.backup_model)
+        logger.warning("Falling back to %s (uncached)", self.backup_model)
         try:
-            responses = await self._collect(self.backup_model, llm_request)
+            responses = await self._collect(self.backup_model, llm_request, snapshot, uncached=True)
         except Exception as exc:  # noqa: BLE001 — surface both failures
             raise RuntimeError(
                 f"primary {self.primary_model} failed ({primary_error}); "
@@ -390,6 +557,21 @@ def quick_model() -> BaseLlm:
     return specialist_model()
 
 
+def search_model() -> BaseLlm:
+    """A grounded (google_search / url_context) sub-agent's model.
+
+    ADK gates its grounding tools on the model name; the wrapper reports the
+    primary's real id, which is what that gate inspects.
+    """
+    primary = search_model_id()
+    backup = os.environ.get("SEARCH_BACKUP_MODEL", DEFAULT_SEARCH_BACKUP_MODEL)
+    return ResilientLlm(
+        primary_model=primary,
+        backup_model=backup if backup != primary else None,
+        max_tokens=8192,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Direct vision calls (read_attachment, image review)
 # ---------------------------------------------------------------------------
@@ -401,6 +583,8 @@ def generate_vision(parts: List[types.Part], model_id: Optional[str] = None) -> 
     the response text; raises on a non-transient error or an empty response
     after retries.
     """
+    import time
+
     from google import genai
 
     model = model_id or vision_model_id()
@@ -422,7 +606,5 @@ def generate_vision(parts: List[types.Part], model_id: Optional[str] = None) -> 
             last_error = exc
         if attempt < _RETRY_ATTEMPTS - 1:
             logger.warning("Vision call to %s retrying (%s)", model, str(last_error)[:200])
-            import time
-
             time.sleep(2 * (attempt + 1))
     raise RuntimeError(f"Vision call to {model} failed: {last_error}")

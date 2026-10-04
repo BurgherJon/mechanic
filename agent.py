@@ -12,8 +12,7 @@ tools are in custom_functions.py.
 import os
 
 # Force Gemini API calls to the `global` endpoint even though the Agent Engine
-# deploys regionally. Claude goes to the first-party Anthropic API and ignores
-# this; the direct vision call (VISION_MODEL) still needs it.
+# deploys regionally. gemini-3.1-pro-preview is served only there.
 os.environ['GOOGLE_CLOUD_LOCATION'] = 'global'
 
 from google.adk.agents import Agent
@@ -190,8 +189,8 @@ MIKE_INSTRUCTION = (
 
 
 root_agent = Agent(
-    # Claude via the first-party Anthropic API (model_utils.py); Mike runs the
-    # specialist-tier model (claude-sonnet-5) as his root per the fleet roster.
+    # Gemini 3.1 Pro on Vertex (model_utils.py) at thinking level medium,
+    # backed by 3.8 Flash.
     model=high_quality_model(),
     generate_content_config=high_quality_config("medium"),
     name='root_agent',
@@ -239,8 +238,8 @@ root_agent = Agent(
 )
 
 
-# App wrapper: turns on prompt caching for the Claude root (tools + system
-# instruction + conversation prefix bill at the cache-read rate after the
+# App wrapper: turns on Vertex context caching for the root (tools + system
+# instruction + conversation prefix bill at the cached rate after the
 # first turn). The Agent Engine loader prefers `app` over `root_agent`.
 app = App(
     name="mechanic",

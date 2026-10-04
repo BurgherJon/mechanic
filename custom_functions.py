@@ -394,7 +394,7 @@ def read_uploaded_file(gcs_uri: str, mime_type: str, purpose: str = "receipt") -
         from .model_utils import generate_vision
 
         # VISION_MODEL (Gemini, global endpoint) with transient retry —
-        # deliberately decoupled from the root agent's Claude model.
+        # deliberately decoupled from the root agent's model.
         extracted = generate_vision([
             types.Part.from_bytes(data=data, mime_type=mime_type),
             types.Part.from_text(text=prompt),
