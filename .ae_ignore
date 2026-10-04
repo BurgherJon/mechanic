@@ -80,3 +80,5 @@ TRADEMARK.md
 LICENSE.txt
 THIRD_PARTY_LICENSES
 .github
+# Dev-only tests (pytest); never shipped to the engine
+tests

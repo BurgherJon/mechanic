@@ -26,8 +26,11 @@ google-genai
 # dep can change under you between deploys — if a deploy suddenly breaks with no
 # code change, suspect a dependency bump first and check the engine build log for
 # versions.
-# Pinned: the engine must run the ADK this code was verified against (2.8.0,
-# with Gemini 3.1 Pro through its native Gemini class; see model_utils.py).
+# Pinned: the engine must run the ADK this code was verified against (2.8.0:
+# native Gemini for the fallback, search and vision; LiteLlm for the rest).
 google-adk[a2a]==2.8.0
+# The local and OpenRouter models run on ADK's LiteLlm class, which imports
+# litellm lazily. Pinned to the version the Comites template runs (AGE-17).
+litellm==1.103.0
 mcp>=1.5,<2
 google-cloud-storage

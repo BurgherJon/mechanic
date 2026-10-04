@@ -11,8 +11,9 @@ tools are in custom_functions.py.
 """
 import os
 
-# Force Gemini API calls to the `global` endpoint even though the Agent Engine
-# deploys regionally. gemini-3.1-pro-preview is served only there.
+# Force Gemini API calls (the Flash fallback and the vision call) to the
+# `global` endpoint even though the Agent Engine deploys regionally; the newest
+# Gemini models are served there first.
 os.environ['GOOGLE_CLOUD_LOCATION'] = 'global'
 
 from google.adk.agents import Agent
@@ -189,9 +190,9 @@ MIKE_INSTRUCTION = (
 
 
 root_agent = Agent(
-    # Gemini 3.1 Pro on Vertex (model_utils.py) at thinking level medium,
-    # backed by 3.8 Flash.
-    model=high_quality_model(),
+    # Local first, else MiMo through OpenRouter, else Gemini Flash
+    # (model_utils.py), at effort medium.
+    model=high_quality_model("medium"),
     generate_content_config=high_quality_config("medium"),
     name='root_agent',
     description=(
@@ -238,9 +239,10 @@ root_agent = Agent(
 )
 
 
-# App wrapper: turns on Vertex context caching for the root (tools + system
-# instruction + conversation prefix bill at the cached rate after the
-# first turn). The Agent Engine loader prefers `app` over `root_agent`.
+# App wrapper: Vertex context caching for the calls that run on Gemini (the
+# fallback); OpenRouter's provider caches MiMo's prompt prefix on its own, and
+# the local server reuses a repeated prefix. The Agent Engine loader prefers
+# `app` over `root_agent`.
 app = App(
     name="mechanic",
     root_agent=root_agent,

@@ -368,11 +368,11 @@ resource "google_storage_bucket_iam_member" "engine_inbound_files_reader" {
 #   done
 locals {
   forum_runtime_roles_for_agent_sa = toset([
-    "roles/aiplatform.user",         # invoke Vertex AI APIs at runtime
+    "roles/aiplatform.user",                   # invoke Vertex AI APIs at runtime
     "roles/serviceusage.serviceUsageConsumer", # aiplatform initializer resolves the Forum project by number at startup; without this every engine logs a 403 USER_PROJECT_DENIED traceback
-    "roles/logging.logWriter",       # emit stdout/stderr to Cloud Logging
-    "roles/monitoring.metricWriter", # emit container metrics
-    "roles/cloudtrace.agent",        # emit traces. NOTE: --trace_to_cloud was removed from deploy_and_update.sh (commit b5adf67) because it triggers a metadata-proxy scope bug with cross-project SAs. We keep this role granted so re-enabling tracing later is a one-line change; remove if you've decided you'll never use it.
+    "roles/logging.logWriter",                 # emit stdout/stderr to Cloud Logging
+    "roles/monitoring.metricWriter",           # emit container metrics
+    "roles/cloudtrace.agent",                  # emit traces. NOTE: --trace_to_cloud was removed from deploy_and_update.sh (commit b5adf67) because it triggers a metadata-proxy scope bug with cross-project SAs. We keep this role granted so re-enabling tracing later is a one-line change; remove if you've decided you'll never use it.
   ])
 }
 
@@ -643,6 +643,47 @@ resource "google_secret_manager_secret" "anthropic_api_key" {
 resource "google_secret_manager_secret_iam_member" "anthropic_api_key_agent_accessor" {
   project   = var.project_id
   secret_id = google_secret_manager_secret.anthropic_api_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.agent.email}"
+}
+
+# ==============================================================================
+# SECTION 9: MODEL-PROVIDER KEYS (OpenRouter + comites.ai LLM server)
+#
+# model_utils.py routes each call to the local models on Jonathan's comites.ai
+# LLM server first, else to MiMo through OpenRouter (2026-10-04). Both keys are
+# read from Secret Manager in this project, once per container; neither is
+# ever in .env or code. Add the values after `terraform apply`:
+#   OpenRouter: printf '%s' "sk-or-..." | gcloud secrets versions add \
+#     ${var.bot_account_id}-openrouter-key --data-file=- --project=${var.project_id}
+#   Local server: see the "comites.ai LLM Connection" page, section 3.1 (the
+#     key is read off the server and piped in, never displayed); `wc -c` on
+#     the stored value must print 59.
+# The readers below are the same identities that read the Anthropic key above.
+# ==============================================================================
+locals {
+  model_provider_keys = {
+    openrouter  = "${var.bot_account_id}-openrouter-key"
+    comites_llm = "comites-llm-key"
+  }
+}
+
+resource "google_secret_manager_secret" "model_provider_key" {
+  for_each  = local.model_provider_keys
+  project   = var.project_id
+  secret_id = each.value
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.secretmanager]
+}
+
+resource "google_secret_manager_secret_iam_member" "model_provider_key_agent_accessor" {
+  for_each  = google_secret_manager_secret.model_provider_key
+  project   = var.project_id
+  secret_id = each.value.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.agent.email}"
 }
