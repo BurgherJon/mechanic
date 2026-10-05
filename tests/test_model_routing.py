@@ -154,7 +154,9 @@ def test_local_off_switch(mu, monkeypatch, value):
     assert mu.high_quality_model().local_model is None
 
 
-# --- AGE-27: scheduled and agent turns, text beside calls, [SILENT] ----------
+# --- AGE-27, rescoped for PLAT-58 ---------------------------------------------
+# The Forum now delivers only the final reply and sends nothing for a job reply
+# that starts or ends with [SILENT]; the router keeps what the Forum can't do.
 
 JOB = "[From: BurgherJon | discord_id: 696018636124454953] Workout check: see if I logged a new workout."
 A2A = "[From Agent: Maggie the Magister | On Behalf Of: Jonathan Cavell] hard_task_and_slobby"
@@ -183,43 +185,74 @@ def test_person_turn_still_goes_local(mu, monkeypatch):
     f = wire(mu, monkeypatch, local=[reply("local reply")], hosted=[reply("never")])
     assert text_of(run(mu.high_quality_model(), req(PERSON))) == "local reply"
 
-def test_text_beside_a_tool_call_is_dropped_and_the_call_kept(mu, monkeypatch):
+def test_text_beside_a_tool_call_is_left_for_the_forum(mu, monkeypatch):
+    # PLAT-58: the Forum delivers only the final reply; the model keeps its plan in view.
     f = wire(mu, monkeypatch, local=[call_reply("query_agent", "Let me notify Maggie, then nudge Jonathan.")])
-    out = run(mu.high_quality_model(), req(PERSON))
-    parts = [p for r in out for p in r.content.parts]
+    parts = [p for r in run(mu.high_quality_model(), req(PERSON)) for p in r.content.parts]
     assert [p.function_call.name for p in parts if p.function_call] == ["query_agent"]
-    assert not any(p.text for p in parts)
+    assert [p.text for p in parts if p.text] == ["Let me notify Maggie, then nudge Jonathan."]
 
-def test_text_only_final_reply_is_untouched_even_with_silent_on_a_persons_turn(mu, monkeypatch):
+def test_silent_on_a_persons_turn_is_untouched(mu, monkeypatch):
     f = wire(mu, monkeypatch, local=[reply("Reply [SILENT] means the job had no news.")])
     assert text_of(run(mu.high_quality_model(), req(PERSON))) == "Reply [SILENT] means the job had no news."
 
-def test_silent_exactly(mu, monkeypatch):
+# The Forum's own PLAT-58 cases (tests/services/test_scheduled_job_executor.py),
+# with the router's verdict. QUIET is exactly the Forum's "ends with" rule; the
+# Forum's "starts with" replies that go on are UNCLEAR here on purpose.
+@pytest.mark.parametrize("text,verdict", [
+    ("[SILENT]", "silent"),
+    ("No workout logged yet and it's only 9am, so no nudge.\n\n[SILENT]", "silent"),
+    ("**[SILENT]**", "silent"),
+    ("`[SILENT]`", "silent"),
+    ("[ SILENT ]", "silent"),
+    ("[SILENT].", "silent"),
+    ("Nothing to report. [SILENT]!", "silent"),
+    ("Nothing to report.\n**[SILENT]**.", "silent"),
+    ("  \n[SILENT]\n  ", "silent"),
+    ("[SILENT].**", "silent"),
+    ("[SILENT] nothing new since last check", "unclear"),
+    ("[SILENT]\n\nWait, that's the wrong token. Hey Jon, it's noon.", "unclear"),
+    ("I stayed quiet — replying [SILENT] — as instructed.", "unclear"),
+    ("Nothing new.\n[SILENT]\nActually, one thing: you ran 5 miles.", "unclear"),
+    ("Nothing new. [silent]", "unclear"),
+    ("~~[SILENT]~~", "unclear"),
+    ("Nothing new. [SILENT] .", "unclear"),
+    ("You ran 5 miles, nice work.", "send"),
+])
+def test_silent_verdict_agrees_with_the_forum(mu, text, verdict):
+    assert mu.silent_verdict(text) == verdict
+
+def test_silent_exactly_passes_through(mu, monkeypatch):
     f = wire(mu, monkeypatch, hosted=[reply("[SILENT]")])
     assert text_of(run(mu.high_quality_model(), req(JOB))) == "[SILENT]"
     assert len(f["openrouter"].seen) == 1
 
-@pytest.mark.parametrize("ending", ["\n\n[SILENT]", " [SILENT]", "\n\n**[SILENT]**", "\n`[SILENT]`.", "\n[ silent ]"])
-def test_silent_at_the_end_becomes_exactly_silent(mu, monkeypatch, ending):
-    f = wire(mu, monkeypatch, hosted=[reply("No new workout: the only activity is already processed." + ending)])
-    assert text_of(run(mu.high_quality_model(), req(JOB))) == "[SILENT]"
+@pytest.mark.parametrize("ending", ["\n\n[SILENT]", " [SILENT]", "\n\n**[SILENT]**", "\n`[SILENT]`.", "\n[ SILENT ]"])
+def test_silent_at_the_end_passes_through_for_the_forum(mu, monkeypatch, ending):
+    text = "No new workout: the only activity is already processed." + ending
+    f = wire(mu, monkeypatch, hosted=[reply(text)])
+    assert text_of(run(mu.high_quality_model(), req(JOB))) == text
     assert len(f["openrouter"].seen) == 1
+
+@pytest.mark.parametrize("ending", ["\n[silent]", "\n~~[SILENT]~~", " [SILENT] ."])
+def test_endings_the_forum_would_deliver_are_asked_again(mu, monkeypatch, ending):
+    f = wire(mu, monkeypatch, hosted=[reply("No new workout." + ending), reply("[SILENT]")])
+    assert text_of(run(mu.high_quality_model(), req(JOB))) == "[SILENT]"
+    assert len(f["openrouter"].seen) == 2
 
 def test_unclear_silent_is_held_back_and_a_clean_second_reply_is_sent(mu, monkeypatch):
     unclear = "[SILENT]\n\nWait, that's the wrong token. Hey Jon, it's noon."
     f = wire(mu, monkeypatch, hosted=[reply(unclear), reply("Hey Jon, it's noon.")])
-    out = run(mu.high_quality_model(), req(JOB))
-    assert text_of(out) == "Hey Jon, it's noon."
-    retry = f["openrouter"].seen[1]["texts"]
-    assert retry[-2:] == [unclear, mu.SILENT_RETRY_NOTE]
+    assert text_of(run(mu.high_quality_model(), req(JOB))) == "Hey Jon, it's noon."
+    assert f["openrouter"].seen[1]["texts"][-2:] == [unclear, mu.SILENT_RETRY_NOTE]
 
 def test_second_reply_is_judged_the_same_as_the_first(mu, monkeypatch):
     f = wire(mu, monkeypatch, hosted=[reply("[SILENT] or maybe not"), reply("Thinking again... [SILENT]")])
-    assert text_of(run(mu.high_quality_model(), req(JOB))) == "[SILENT]"
+    assert text_of(run(mu.high_quality_model(), req(JOB))) == "Thinking again... [SILENT]"
+    assert len(f["openrouter"].seen) == 2
 
 def test_three_unclear_replies_are_not_delivered_and_logged(mu, monkeypatch, caplog):
-    unclear = [reply("[SILENT] but here is a message") for _ in range(3)]
-    f = wire(mu, monkeypatch, hosted=unclear)
+    f = wire(mu, monkeypatch, hosted=[reply("[SILENT] but here is a message") for _ in range(3)])
     with caplog.at_level("WARNING"):
         out = run(mu.high_quality_model(), req(JOB))
     assert text_of(out) == "[SILENT]"
@@ -232,8 +265,6 @@ def test_no_silent_token_is_sent_as_written(mu, monkeypatch):
 
 def test_silent_rules_skip_a_scheduled_tool_step(mu, monkeypatch):
     f = wire(mu, monkeypatch, hosted=[call_reply("get_recent_activities", "Checking... [SILENT] maybe")])
-    out = run(mu.high_quality_model(), req(JOB))
-    parts = [p for r in out for p in r.content.parts]
+    parts = [p for r in run(mu.high_quality_model(), req(JOB)) for p in r.content.parts]
     assert [p.function_call.name for p in parts if p.function_call] == ["get_recent_activities"]
-    assert not any(p.text for p in parts)
     assert len(f["openrouter"].seen) == 1

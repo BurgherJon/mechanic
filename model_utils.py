@@ -84,17 +84,22 @@ Rules this module encodes, each learned in production:
    counts the serving model reports.
 11. Log the whole error, not its first 200 characters: ADK's text opens
    with a preamble, and the status, quota and Retry-After come after it.
-12. Text written beside a tool call never reaches the Forum (AGE-27). The
-   Forum delivers every text part of a turn, so "Let me notify Maggie,
-   then nudge Jonathan." reached a Discord on 2026-10-05; Gemini rarely
-   wrote such text, Qwen and MiMo do. Each agent's prompt carries
-   REPLY_DELIVERY_NOTE, which tells the model so.
-13. On a scheduled turn, `[SILENT]` may close the reply (AGE-27). The Forum
-   only suppresses a reply that starts with it, while Qwen explains first
-   and decides last (Mickey's hourly workout check, all day 2026-10-05).
-   A reply that ends with the token becomes exactly `[SILENT]`; one with
-   the token anywhere else is held back and the model is asked again, up
-   to three replies, and one still unclear then is not delivered.
+12. Text written beside a tool call never reaches the user: the Forum
+   delivers only the turn's final reply (PLAT-58). Before that, "Let me
+   notify Maggie, then nudge Jonathan." reached a Discord (2026-10-05);
+   Gemini rarely wrote such text, Qwen and MiMo do. The router leaves the
+   text in the history, so the model keeps its own plan in view mid-turn
+   and the Forum's fallback (all text, when the final reply has none)
+   still has it. Each agent's prompt carries REPLY_DELIVERY_NOTE.
+13. On a scheduled turn, a reply the Forum cannot read is asked again
+   (AGE-27). The Forum sends nothing for a job's reply that starts or ends
+   with `[SILENT]` (PLAT-58), but it cannot ask what a contradictory reply
+   meant: one that starts with the token and goes on ("[SILENT] … Wait,
+   wrong token … Hey Jon", Dare, 2026-10-05) would be suppressed with a
+   nudge in it, and one with the token anywhere else delivered with the
+   token showing. The router holds such a reply back and asks the model
+   again, up to three replies; one still unclear is not delivered. Its
+   test for "the Forum will handle this" is the Forum's own pattern.
 """
 import asyncio
 import collections
@@ -690,7 +695,8 @@ def strip_response_thoughts(responses: List[LlmResponse]) -> int:
 
 
 # Rule 12's instruction, included once in each agent's static prompt (ahead
-# of any per-turn block, so it caches). Keep it beside the code it describes.
+# of any per-turn block, so it caches). It describes the Forum's delivery
+# rule (PLAT-58): only the turn's final reply reaches the user.
 REPLY_DELIVERY_NOTE = (
     "\n\n## How your replies reach the user\n\n"
     "Only a message with no tool call reaches the user. Anything you write in "
@@ -699,29 +705,6 @@ REPLY_DELIVERY_NOTE = (
     "complete message the user should see, including anything you found along "
     "the way that they'd want to know.\n"
 )
-
-
-def drop_text_beside_calls(responses: List[LlmResponse]) -> int:
-    """Remove the text from any response that also carries a tool call (rule 12).
-
-    The call is kept. If a model's only real answer sat beside a call, its
-    final response comes back empty and the empty-reply handling retries.
-    Mutates in place; returns the number of text parts dropped.
-    """
-    dropped = 0
-    for response in responses:
-        content = response.content
-        if content is None or not content.parts:
-            continue
-        if not any(p.function_call is not None for p in content.parts):
-            continue
-        kept = [
-            p for p in content.parts
-            if p.text is None or p.function_call is not None or p.function_response is not None
-        ]
-        dropped += len(content.parts) - len(kept)
-        content.parts = kept
-    return dropped
 
 
 # Gemini 3 validates a thought signature on every function call in the
@@ -863,8 +846,15 @@ def turn_kind(contents: List[types.Content]) -> Optional[str]:
 # --- [SILENT] on scheduled turns (rule 13) -----------------------------------
 
 SILENT_TOKEN = "[SILENT]"
-# The token, allowing for markdown around it and spaces inside the brackets.
-_SILENT_RE = re.compile(r"[`*_~]*\[\s*silent\s*\][`*_~]*", re.IGNORECASE)
+# The Forum's own rule (the-forum, PLAT-58: is_silent_reply in
+# scheduled_job_executor_v2.py), copied so the two cannot drift: a job's
+# reply that ends with the token, markdown and a trailing "." or "!"
+# allowed, delivers nothing. (The Forum also silences a reply that starts
+# with it; the router asks again when such a reply goes on.)
+_FORUM_SILENT_TOKEN = r"[*_`]*\[\s*SILENT\s*\]"
+_FORUM_SILENT_AT_END = re.compile(rf"{_FORUM_SILENT_TOKEN}[*_`.!]*$")
+# Any spelling of the token, to catch the ones the Forum's rule would deliver.
+_ANY_SILENT = re.compile(r"\[\s*silent\s*\]", re.IGNORECASE)
 # Replies in all, the first included, before an unclear reply is given up on;
 # keeps the turn inside the Forum's 300 seconds.
 _SILENT_REPLIES = 3
@@ -880,13 +870,14 @@ SILENT_UNCLEAR = "unclear"
 
 
 def silent_verdict(text: str) -> str:
-    """SILENT_QUIET when the reply is, or ends with, the token; SILENT_UNCLEAR
-    when the token sits anywhere else; SILENT_SEND when there is none."""
+    """SILENT_SEND when the reply has no token; SILENT_QUIET when it ends with
+    the token by the Forum's rule (the Forum then sends nothing);
+    SILENT_UNCLEAR for any other token, including one at the start of a
+    reply that goes on."""
     stripped = text.strip()
-    matches = list(_SILENT_RE.finditer(stripped))
-    if not matches:
+    if not _ANY_SILENT.search(stripped):
         return SILENT_SEND
-    if not stripped[matches[-1].end():].strip(" \t\r\n.!"):
+    if _FORUM_SILENT_AT_END.search(stripped):
         return SILENT_QUIET
     return SILENT_UNCLEAR
 
@@ -1037,9 +1028,6 @@ class ResilientLlm(BaseLlm):
                 if line:
                     logger.info(line)
                 strip_response_thoughts(responses)
-                dropped = drop_text_beside_calls(responses)
-                if dropped:
-                    logger.info("Dropped %d text part(s) %s wrote beside a tool call", dropped, model_id)
                 return responses
             except Exception as exc:  # noqa: BLE001 — inspect, re-raise non-transient
                 last = attempt == attempts - 1
@@ -1189,12 +1177,14 @@ class ResilientLlm(BaseLlm):
     ) -> List[LlmResponse]:
         """Rule 13 on a scheduled turn's final reply.
 
-        The reply that is, or ends with, `[SILENT]` becomes exactly
-        `[SILENT]`. One with the token anywhere else is held back, and the
+        A reply with no token, or one ending with it by the Forum's rule,
+        passes through untouched: the Forum delivers it or sends nothing
+        (PLAT-58). Any other reply with the token is held back, and the
         model that wrote it is asked again with SILENT_RETRY_NOTE; neither
         the held reply nor the note reaches the session, which keeps only
         what is returned here. Every reply is judged the same way, up to
-        `_SILENT_REPLIES` in all; one still unclear then is not delivered.
+        `_SILENT_REPLIES` in all; one still unclear then is not delivered
+        (it becomes exactly `[SILENT]`).
         """
         for reply in range(1, _SILENT_REPLIES + 1):
             text = _final_text(responses)
@@ -1204,12 +1194,8 @@ class ResilientLlm(BaseLlm):
                 logger.warning("Asked again after an unclear [SILENT], %s gave no reply; not delivered", model_id)
                 return _say(responses, SILENT_TOKEN)
             verdict = silent_verdict(text)
-            if verdict == SILENT_SEND:
+            if verdict in (SILENT_SEND, SILENT_QUIET):
                 return responses
-            if verdict == SILENT_QUIET:
-                if text.strip() != SILENT_TOKEN:
-                    logger.info("Reply ends with [SILENT]; sending nothing (%d characters before it discarded)", len(text))
-                return _say(responses, SILENT_TOKEN)
             if reply == _SILENT_REPLIES:
                 logger.warning(
                     "Reply %d of %d still has [SILENT] with more text after it; not delivered: %s",
