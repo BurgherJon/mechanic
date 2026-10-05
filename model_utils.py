@@ -53,7 +53,11 @@ Rules this module encodes, each learned in production:
    reply keeps one voice (seen 2026-09-27: a Flash backup finished a Pro
    turn in a different voice). A local call that fails, times out or runs
    out of output tokens escalates; it is never retried at length, because
-   the Forum gives a whole turn 300 seconds.
+   the Forum gives a whole turn 300 seconds. A turn a scheduled job or
+   another agent started goes to the hosted model whatever its size
+   (AGE-27): those are the protocol-heavy turns ([SILENT], published
+   inquiry formats), nobody is waiting on them, and Qwen lost Dare's noon
+   protocol in plain view on 2026-10-05.
 6. Retry transient serving errors (408 / 429 / 5xx) on the hosted model
    before failing a turn, honouring a Retry-After. An empty final response
    gets one retry of the hosted model after a short pause, then the
@@ -80,6 +84,17 @@ Rules this module encodes, each learned in production:
    counts the serving model reports.
 11. Log the whole error, not its first 200 characters: ADK's text opens
    with a preamble, and the status, quota and Retry-After come after it.
+12. Text written beside a tool call never reaches the Forum (AGE-27). The
+   Forum delivers every text part of a turn, so "Let me notify Maggie,
+   then nudge Jonathan." reached a Discord on 2026-10-05; Gemini rarely
+   wrote such text, Qwen and MiMo do. Each agent's prompt carries
+   REPLY_DELIVERY_NOTE, which tells the model so.
+13. On a scheduled turn, `[SILENT]` may close the reply (AGE-27). The Forum
+   only suppresses a reply that starts with it, while Qwen explains first
+   and decides last (Mickey's hourly workout check, all day 2026-10-05).
+   A reply that ends with the token becomes exactly `[SILENT]`; one with
+   the token anywhere else is held back and the model is asked again, up
+   to three replies, and one still unclear then is not delivered.
 """
 import asyncio
 import collections
@@ -88,6 +103,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -673,6 +689,41 @@ def strip_response_thoughts(responses: List[LlmResponse]) -> int:
     return dropped
 
 
+# Rule 12's instruction, included once in each agent's static prompt (ahead
+# of any per-turn block, so it caches). Keep it beside the code it describes.
+REPLY_DELIVERY_NOTE = (
+    "\n\n## How your replies reach the user\n\n"
+    "Only a message with no tool call reaches the user. Anything you write in "
+    "the same response as a tool call is discarded unseen, so don't narrate "
+    "what you're about to do. When you've finished with tools, write the "
+    "complete message the user should see, including anything you found along "
+    "the way that they'd want to know.\n"
+)
+
+
+def drop_text_beside_calls(responses: List[LlmResponse]) -> int:
+    """Remove the text from any response that also carries a tool call (rule 12).
+
+    The call is kept. If a model's only real answer sat beside a call, its
+    final response comes back empty and the empty-reply handling retries.
+    Mutates in place; returns the number of text parts dropped.
+    """
+    dropped = 0
+    for response in responses:
+        content = response.content
+        if content is None or not content.parts:
+            continue
+        if not any(p.function_call is not None for p in content.parts):
+            continue
+        kept = [
+            p for p in content.parts
+            if p.text is None or p.function_call is not None or p.function_response is not None
+        ]
+        dropped += len(content.parts) - len(kept)
+        content.parts = kept
+    return dropped
+
+
 # Gemini 3 validates a thought signature on every function call in the
 # current turn. A call made by another model carries none, so the turn is
 # rejected with 400 "Function call is missing a thought_signature". Google's
@@ -775,6 +826,92 @@ def _turn_key(contents: List[types.Content]) -> Optional[str]:
                 if part.text:
                     digest.update(part.text.encode("utf-8", "ignore"))
     return f"{last}:{digest.hexdigest()}"
+
+
+TURN_PERSON = "person"
+TURN_SCHEDULED = "scheduled"
+TURN_AGENT = "agent"
+
+# The prefixes the Forum puts on the message that starts a turn (the-forum:
+# message_processor_v2.py, scheduled_job_executor_v2.py, agents_mcp.py):
+#   a person        [From: Name] [time] ...
+#   a fired job     [From: Name | discord_id: 123] ...
+#   another agent   [From Agent: Maggie | On Behalf Of: Name] ...
+_SCHEDULED_PREFIX = re.compile(r"\[From: [^\]|]+ \| [A-Za-z_]+_id: [^\]]*\]")
+_AGENT_PREFIX = re.compile(r"\[From Agent: [^\]|]+ \| On Behalf Of: [^\]]*\]")
+
+
+def turn_kind(contents: List[types.Content]) -> Optional[str]:
+    """Who started the turn: TURN_SCHEDULED, TURN_AGENT or TURN_PERSON, read
+    from the Forum's prefix on the turn's latest user message; None when no
+    user message carries text (a sub-agent's own context has no prefix and
+    counts as a person's turn)."""
+    for content in reversed(contents):
+        if content.role != "user":
+            continue
+        text = "".join(p.text or "" for p in content.parts or [] if not p.thought).lstrip()
+        if not text:
+            continue
+        if _SCHEDULED_PREFIX.match(text):
+            return TURN_SCHEDULED
+        if _AGENT_PREFIX.match(text):
+            return TURN_AGENT
+        return TURN_PERSON
+    return None
+
+
+# --- [SILENT] on scheduled turns (rule 13) -----------------------------------
+
+SILENT_TOKEN = "[SILENT]"
+# The token, allowing for markdown around it and spaces inside the brackets.
+_SILENT_RE = re.compile(r"[`*_~]*\[\s*silent\s*\][`*_~]*", re.IGNORECASE)
+# Replies in all, the first included, before an unclear reply is given up on;
+# keeps the turn inside the Forum's 300 seconds.
+_SILENT_REPLIES = 3
+SILENT_RETRY_NOTE = (
+    "Your reply was not delivered: it contained [SILENT] but went on with more "
+    "text, so it's unclear whether you meant to stay silent. Reply again with "
+    "either exactly [SILENT] (send nothing) or the message to send, with no "
+    "[SILENT] in it and no explanation."
+)
+SILENT_SEND = "send"
+SILENT_QUIET = "silent"
+SILENT_UNCLEAR = "unclear"
+
+
+def silent_verdict(text: str) -> str:
+    """SILENT_QUIET when the reply is, or ends with, the token; SILENT_UNCLEAR
+    when the token sits anywhere else; SILENT_SEND when there is none."""
+    stripped = text.strip()
+    matches = list(_SILENT_RE.finditer(stripped))
+    if not matches:
+        return SILENT_SEND
+    if not stripped[matches[-1].end():].strip(" \t\r\n.!"):
+        return SILENT_QUIET
+    return SILENT_UNCLEAR
+
+
+def _final_text(responses: List[LlmResponse]) -> Optional[str]:
+    """The text of a turn's final reply, or None when the last response is a
+    tool step or carries no text."""
+    if not responses or responses[-1].content is None:
+        return None
+    parts = responses[-1].content.parts or []
+    if any(p.function_call is not None for p in parts):
+        return None
+    text = "".join(p.text or "" for p in parts if not p.thought)
+    return text if text.strip() else None
+
+
+def _say(responses: List[LlmResponse], text: str) -> List[LlmResponse]:
+    """Make the final response say exactly `text` (usage and finish kept)."""
+    if not responses:
+        return [LlmResponse(content=types.Content(role="model", parts=[types.Part(text=text)]))]
+    final = responses[-1]
+    if final.content is None:
+        final.content = types.Content(role="model", parts=[])
+    final.content.parts = [types.Part(text=text)]
+    return responses
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +1037,9 @@ class ResilientLlm(BaseLlm):
                 if line:
                     logger.info(line)
                 strip_response_thoughts(responses)
+                dropped = drop_text_beside_calls(responses)
+                if dropped:
+                    logger.info("Dropped %d text part(s) %s wrote beside a tool call", dropped, model_id)
                 return responses
             except Exception as exc:  # noqa: BLE001 — inspect, re-raise non-transient
                 last = attempt == attempts - 1
@@ -968,8 +1108,6 @@ class ResilientLlm(BaseLlm):
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
     ):
-        primary_error: Optional[BaseException] = None
-        responses: List[LlmResponse] = []
         # Rules 7 and 8: repaired once here, so every model sees a clean history.
         if llm_request.contents:
             heal_orphaned_tool_calls(llm_request.contents)
@@ -977,22 +1115,37 @@ class ResilientLlm(BaseLlm):
                 logger.info("Dropped thought parts from the history")
         # Taken after the repair, before any model sees the request.
         snapshot = _RequestSnapshot(llm_request)
-        turn = _turn_key(llm_request.contents or [])
+        contents = llm_request.contents or []
+        turn = _turn_key(contents)
+        kind = turn_kind(contents)
         estimate = estimate_request_tokens(llm_request)
 
+        # Rule 5: a job's or another agent's turn goes to the hosted model.
+        if kind in (TURN_SCHEDULED, TURN_AGENT) and self.local_model and self._turns.get(turn) != ROUTE_HOSTED:
+            logger.info("Routing to %s: a %s turn", self.primary_model, kind)
+            self._remember(turn, ROUTE_HOSTED)
+
+        responses, model_id = await self._answer(llm_request, snapshot, turn, estimate)
+        if kind == TURN_SCHEDULED:
+            responses = await self._settle_silent(llm_request, snapshot, model_id, responses, estimate)
+        for response in responses:
+            yield response
+
+    async def _answer(
+        self, llm_request: LlmRequest, snapshot: _RequestSnapshot, turn: Optional[str], estimate: int
+    ) -> Tuple[List[LlmResponse], str]:
+        """One model call routed by rules 5 and 6: the responses and the model that gave them."""
         local = await self._try_local(llm_request, snapshot, turn, estimate)
         if local is not None:
-            for response in local:
-                yield response
-            return
+            return local, self.local_model or ""
 
+        primary_error: Optional[BaseException] = None
+        responses: List[LlmResponse] = []
         try:
             for attempt in range(2):
                 responses = await self._collect(self.primary_model, llm_request, snapshot, estimate=estimate)
                 if not self._is_degenerate(responses):
-                    for response in responses:
-                        yield response
-                    return
+                    return responses, self.primary_model
                 finish = responses[-1].finish_reason if responses else None
                 if attempt == 0:
                     # Rule 6: an empty STOP is usually a fluke; one more try on
@@ -1014,9 +1167,7 @@ class ResilientLlm(BaseLlm):
         if not self.backup_model:
             if primary_error is not None:
                 raise primary_error
-            for response in responses:
-                yield response
-            return
+            return responses, self.primary_model
 
         logger.warning("Falling back to %s (uncached)", self.backup_model)
         try:
@@ -1026,8 +1177,62 @@ class ResilientLlm(BaseLlm):
                 f"primary {self.primary_model} failed ({describe_error(primary_error) if primary_error else 'empty reply'}); "
                 f"backup {self.backup_model} failed ({describe_error(exc)})"
             ) from exc
-        for response in responses:
-            yield response
+        return responses, self.backup_model
+
+    async def _settle_silent(
+        self,
+        llm_request: LlmRequest,
+        snapshot: _RequestSnapshot,
+        model_id: str,
+        responses: List[LlmResponse],
+        estimate: int,
+    ) -> List[LlmResponse]:
+        """Rule 13 on a scheduled turn's final reply.
+
+        The reply that is, or ends with, `[SILENT]` becomes exactly
+        `[SILENT]`. One with the token anywhere else is held back, and the
+        model that wrote it is asked again with SILENT_RETRY_NOTE; neither
+        the held reply nor the note reaches the session, which keeps only
+        what is returned here. Every reply is judged the same way, up to
+        `_SILENT_REPLIES` in all; one still unclear then is not delivered.
+        """
+        for reply in range(1, _SILENT_REPLIES + 1):
+            text = _final_text(responses)
+            if text is None:
+                if reply == 1 or not self._is_degenerate(responses):
+                    return responses  # a tool step, or the turn's own empty reply
+                logger.warning("Asked again after an unclear [SILENT], %s gave no reply; not delivered", model_id)
+                return _say(responses, SILENT_TOKEN)
+            verdict = silent_verdict(text)
+            if verdict == SILENT_SEND:
+                return responses
+            if verdict == SILENT_QUIET:
+                if text.strip() != SILENT_TOKEN:
+                    logger.info("Reply ends with [SILENT]; sending nothing (%d characters before it discarded)", len(text))
+                return _say(responses, SILENT_TOKEN)
+            if reply == _SILENT_REPLIES:
+                logger.warning(
+                    "Reply %d of %d still has [SILENT] with more text after it; not delivered: %s",
+                    reply, _SILENT_REPLIES, text[:500],
+                )
+                return _say(responses, SILENT_TOKEN)
+            logger.warning(
+                "Reply %d of %d has [SILENT] with more text after it; held back, asking %s again",
+                reply, _SILENT_REPLIES, model_id,
+            )
+            snapshot.restore(llm_request, uncached=True)
+            llm_request.contents = list(llm_request.contents or []) + [
+                types.Content(role="model", parts=[types.Part(text=text)]),
+                types.Content(role="user", parts=[types.Part(text=SILENT_RETRY_NOTE)]),
+            ]
+            try:
+                responses = await self._collect(
+                    model_id, llm_request, _RequestSnapshot(llm_request), uncached=True, estimate=estimate
+                )
+            except Exception as exc:  # noqa: BLE001 — the held reply stays undelivered
+                logger.warning("Asking %s again failed (%s); not delivered", model_id, describe_error(exc))
+                return _say(responses, SILENT_TOKEN)
+        return responses
 
 
 # ---------------------------------------------------------------------------

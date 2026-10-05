@@ -24,7 +24,7 @@ from google.adk.tools import FunctionTool
 from google.adk.tools.agent_tool import AgentTool  # noqa: F401
 
 from .comites_standard import magister_instruction
-from .model_utils import high_quality_config, high_quality_model
+from .model_utils import REPLY_DELIVERY_NOTE, high_quality_config, high_quality_model
 from .custom_functions import (
     add_reminder,
     add_vehicle,
@@ -204,7 +204,7 @@ root_agent = Agent(
     # (focus_items, review_idea, write-via-Magister rule) when
     # MAGISTER_DISPLAY_NAME is set; unset, it returns "" and Mike runs
     # standalone exactly as before.
-    instruction=MIKE_INSTRUCTION + magister_instruction(),
+    instruction=MIKE_INSTRUCTION + REPLY_DELIVERY_NOTE + magister_instruction(),
     tools=[
         # Persistent memory (Google Doc).
         FunctionTool(get_agent_memory),
